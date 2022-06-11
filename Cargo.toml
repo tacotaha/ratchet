@@ -6,8 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hkdf = "0.12.3"
+aes = "0.8.1"
+cbc = "0.1.2"
 hex-literal = "0.3.4"
+hkdf = "0.12.3"
+hmac = "0.12.1"
 rand = "0.7.0"
 sha2 = "0.10.2"
 x25519-dalek = "1.2.0"
