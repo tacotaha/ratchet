@@ -4,6 +4,7 @@ pub mod state {
     use std::collections::HashMap;
     use std::fmt;
 
+    // max msg skips in a single chain
     const MAX_SKIP: u32 = 1 << 10;
 
     #[derive(Debug, Clone)]
@@ -28,16 +29,17 @@ pub mod state {
         pub auth: Vec<u8>,
     }
 
+    // each party stores the following values per conversation
     pub struct State {
-        root_key: [u8; 32],
-        dh_self: crypto::KeyPair,
-        ck_self: [u8; 32],
-        n_send: u32,
-        dh_remote: Option<crypto::PublicKey>,
-        ck_remote: [u8; 32],
-        n_recv: u32,
-        n_prev: u32,
-        skipped: HashMap<([u8; 32], u32), [u8; 32]>,
+        root_key: [u8; 32],                          // 32 byte root key
+        dh_self: crypto::KeyPair,                    // local ratchet key
+        ck_self: [u8; 32],                           // local chain key
+        n_send: u32,                                 // sending msg number
+        dh_remote: Option<crypto::PublicKey>,        // remote ratchet key
+        ck_remote: [u8; 32],                         // remote chain key
+        n_recv: u32,                                 // receiving msg number
+        n_prev: u32,                                 // length of previous sending chain
+        skipped: HashMap<([u8; 32], u32), [u8; 32]>, // skipped messages (upper bound: MAX_SKIP)
     }
 
     impl State {
@@ -51,6 +53,7 @@ pub mod state {
             self.dh_remote
         }
 
+        // generate a message header from current state
         pub fn header(&self) -> Header {
             Header {
                 public_key: self.dh_self.public().to_bytes(),
@@ -59,6 +62,9 @@ pub mod state {
             }
         }
 
+        // initialize sender using a shared key and a remote public key.
+        // we assume both parties negotiated a 32 byte shared key
+        // and a recipient ratchet public key.
         pub fn init_sender(sk: &[u8; 32], pk: [u8; 32]) -> Self {
             let key_pair = crypto::KeyPair::generate();
             let remote_pk = crypto::PublicKey::from(pk);
@@ -77,6 +83,7 @@ pub mod state {
             }
         }
 
+        // initialize receiver using a shared key and a local key pair
         pub fn init_receiver(sk: [u8; 32], kp: crypto::KeyPair) -> Self {
             Self {
                 root_key: sk,
@@ -91,6 +98,7 @@ pub mod state {
             }
         }
 
+        // encrypt plaintext pt with message key mk and authenticate ad
         pub fn encrypt(&mut self, pt: &[u8], ad: &[u8]) -> Message {
             let (ck, mk) = crypto::kdf_ck(&self.ck_self).unwrap();
             let header = self.header();
@@ -105,6 +113,7 @@ pub mod state {
             }
         }
 
+        //  decrypt message payload and verify auth tag
         pub fn decrypt(&mut self, msg: &mut Message) -> Vec<u8> {
             let pt = self.try_skip(msg);
             if pt.is_some() {
@@ -125,6 +134,7 @@ pub mod state {
             crypto::decrypt(&mk, &mut msg.payload, &msg.auth).unwrap()
         }
 
+        // check if this message corresponds to a skipped key
         pub fn try_skip(&mut self, msg: &mut Message) -> Option<Vec<u8>> {
             let key = (msg.header.public_key, msg.header.msg_num);
             let val = self.skipped.remove_entry(&key);
@@ -136,6 +146,7 @@ pub mod state {
             None
         }
 
+        // skip a message interval on an out of order message
         pub fn skip(&mut self, until: u32) -> Result<(), MsgOverflowError> {
             if until > self.n_recv + MAX_SKIP {
                 return Err(MsgOverflowError);
@@ -146,7 +157,7 @@ pub mod state {
                     let (ck_r, mk) = crypto::kdf_ck(&self.ck_remote).unwrap();
                     self.ck_remote = ck_r;
                     let key = (self.dh_remote.unwrap().to_bytes(), self.n_recv);
-                    self.skipped.insert(key, mk);
+                    self.skipped.insert(key, mk); // save skipped message key
                     self.n_recv += 1
                 }
             }
@@ -154,6 +165,7 @@ pub mod state {
             Ok(())
         }
 
+        // preform a single DH ratchet step
         pub fn ratchet(&mut self, header: &Header) {
             self.n_prev = self.n_send;
             self.n_send = 0;

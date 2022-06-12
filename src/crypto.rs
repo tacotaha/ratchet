@@ -11,7 +11,6 @@ pub mod crypto {
     use zeroize::Zeroize;
 
     const BLOCK_SIZE: usize = 32;
-
     type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
     type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
     type Key32 = [u8; 32];
@@ -25,12 +24,14 @@ pub mod crypto {
         }
     }
 
+    // Curve25519 key pair
     pub struct KeyPair {
         private: StaticSecret,
         public: PublicKey,
     }
 
     impl KeyPair {
+        // generate a random key pair
         pub fn generate() -> Self {
             let sk = StaticSecret::new(OsRng);
             Self {
@@ -40,21 +41,26 @@ pub mod crypto {
         }
 
         #[inline]
+        // dump public key
         pub fn public(&self) -> PublicKey {
             self.public
         }
 
         #[inline]
+        // zero private key
         pub fn zero(&mut self) {
             self.private.zeroize();
         }
 
         #[inline]
+        // run x25519 ECDH key exchange
+        // see: https://datatracker.ietf.org/doc/html/rfc7748
         pub fn dh(&self, pk: PublicKey) -> SharedSecret {
             self.private.diffie_hellman(&pk)
         }
     }
 
+    // derive a 32 byte root key and chain key
     pub fn kdf_rk(rk: &Key32, dh_out: &Key32) -> Result<(Key32, Key32), hkdf::InvalidLength> {
         let mut okm = [0u8; 64];
 
@@ -66,6 +72,7 @@ pub mod crypto {
         Ok((root_key.try_into().unwrap(), chain_key.try_into().unwrap()))
     }
 
+    // derive a 32 byte chain key and message key
     pub fn kdf_ck(ck: &Key32) -> Result<(Key32, Key32), InvalidLength> {
         let mut mac = Hmac::<Sha512>::new_from_slice(ck)?;
         mac.update(b"ratchet-hmac-sha512");
@@ -76,6 +83,7 @@ pub mod crypto {
         Ok((chain_key.try_into().unwrap(), msg_key.try_into().unwrap()))
     }
 
+    // derive a 32 byte encryption key, authentication key, and a 16 byte IV
     pub fn kdf_aes(mk: &[u8]) -> Result<(Key32, Key32, Key16), hkdf::InvalidLength> {
         let salt = [0u8; 64];
         let mut okm = [0u8; 80];
@@ -87,12 +95,13 @@ pub mod crypto {
         let (auth_key, iv) = rest.split_at(32);
 
         Ok((
-            enc_key.try_into().unwrap(),
-            auth_key.try_into().unwrap(),
-            iv.try_into().unwrap(),
+            enc_key.try_into().unwrap(),  // 32 byte enc key
+            auth_key.try_into().unwrap(), // 32 byte auth key
+            iv.try_into().unwrap(),       // 16 byte IV
         ))
     }
 
+    // encrypt pt under mk and append an auth tag
     pub fn encrypt(mk: &[u8], pt: &[u8], data: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let (enc_key, auth_key, iv) = kdf_aes(mk).or_else(|e| Err(CryptoError))?;
         let pt_len = pt.len();
@@ -110,6 +119,7 @@ pub mod crypto {
         Ok([ct, &auth_tag].concat())
     }
 
+    // decrypt ct under mk and verify auth tag
     pub fn decrypt(mk: &[u8], ct: &mut [u8], data: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let payload_len = ct.len() - 64;
         let (payload, auth_tag) = ct.split_at_mut(payload_len);
