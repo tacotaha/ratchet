@@ -5,6 +5,7 @@ pub mod crypto {
     use rand::rngs::OsRng;
     use sha2::Sha512;
     pub use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
+    use zeroize::Zeroize;
 
     const BLOCK_SIZE: usize = 32;
     type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
@@ -27,6 +28,11 @@ pub mod crypto {
         #[inline]
         pub fn public(&self) -> PublicKey {
             self.public
+        }
+
+        #[inline]
+        pub fn zero(&mut self) {
+            self.private.zeroize();
         }
 
         #[inline]

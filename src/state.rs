@@ -1,27 +1,69 @@
 pub mod state {
-    use crate::crypto::crypto::{kdf_rk, KeyPair, PublicKey};
+    use crate::crypto::crypto;
+    use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
+    use std::fmt;
+
+    const MAX_SKIP: u32 = 1 << 10;
+
+    #[derive(Debug, Clone)]
+    struct MsgOverflowError;
+    impl fmt::Display for MsgOverflowError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "message overflow error")
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Header {
+        pub public_key: [u8; 32],
+        pub prev_chain_len: u32,
+        pub msg_num: u32,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Message {
+        pub header: Vec<u8>,
+        pub payload: Vec<u8>,
+        pub ad: Vec<u8>,
+    }
 
     pub struct State {
         root_key: [u8; 32],
-        dh_self: KeyPair,
+        dh_self: crypto::KeyPair,
         ck_self: [u8; 32],
         n_send: u32,
-        dh_remote: Option<PublicKey>,
+        dh_remote: Option<crypto::PublicKey>,
         ck_remote: [u8; 32],
         n_recv: u32,
         n_prev: u32,
-        skipped: HashMap<[u8; 32], u32>,
+        skipped: HashMap<([u8; 32], u32), [u8; 32]>,
     }
 
     impl State {
-        const MAX_SKIP: u8 = 0x20;
+        #[inline]
+        pub fn dh_self(self) -> crypto::KeyPair {
+            self.dh_self
+        }
+
+        #[inline]
+        pub fn dh_remote(self) -> Option<crypto::PublicKey> {
+            self.dh_remote
+        }
+
+        pub fn header(&self) -> Header {
+            Header {
+                public_key: self.dh_self.public().to_bytes(),
+                prev_chain_len: self.n_prev,
+                msg_num: self.n_send,
+            }
+        }
 
         pub fn init_sender(sk: &[u8; 32], pk: [u8; 32]) -> Self {
-            let key_pair = KeyPair::generate();
-            let remote_pk = PublicKey::from(pk);
+            let key_pair = crypto::KeyPair::generate();
+            let remote_pk = crypto::PublicKey::from(pk);
             let shared_key = key_pair.dh(remote_pk);
-            let (root_key, chain_key) = kdf_rk(sk, shared_key.as_bytes());
+            let (root_key, chain_key) = crypto::kdf_rk(sk, shared_key.as_bytes());
             Self {
                 root_key,
                 dh_self: key_pair,
@@ -35,7 +77,7 @@ pub mod state {
             }
         }
 
-        pub fn init_receiver(sk: [u8; 32], kp: KeyPair) -> Self {
+        pub fn init_receiver(sk: [u8; 32], kp: crypto::KeyPair) -> Self {
             Self {
                 root_key: sk,
                 dh_self: kp,
@@ -49,22 +91,96 @@ pub mod state {
             }
         }
 
-        #[inline]
-        pub fn dh_self(self) -> KeyPair {
-            self.dh_self
+        pub fn encrypt(&mut self, pt: &[u8], ad: &[u8]) -> (Vec<u8>, Vec<u8>) {
+            let (ck, mk) = crypto::kdf_ck(&self.ck_self);
+            let header = serde_json::to_vec(&self.header()).unwrap();
+            self.ck_self = ck;
+            self.n_send += 1;
+            let payload = [ad, &header].concat();
+            (header, crypto::encrypt(&mk, pt, payload.as_slice()))
         }
 
-        #[inline]
-        pub fn dh_remote(self) -> Option<PublicKey> {
-            self.dh_remote
+        pub fn decrypt(&mut self, header: &Header, ct: &mut [u8], ad: &[u8]) -> Vec<u8> {
+            let pt = self.try_skip(header, ct, ad);
+            if pt.is_some() {
+                return pt.unwrap();
+            }
+
+            if self.dh_remote.is_none() || header.public_key.ne(self.dh_remote.unwrap().as_bytes())
+            {
+                self.skip(header.msg_num).unwrap();
+                self.ratchet(header);
+            }
+
+            self.skip(header.msg_num).unwrap();
+            let (ck_r, mk) = crypto::kdf_ck(&self.ck_remote);
+            self.ck_remote = ck_r;
+            self.n_recv += 1;
+
+            let header = serde_json::to_vec(header).unwrap();
+            let data = [ad, &header].concat();
+            crypto::decrypt(&mk, ct, &data)
+        }
+
+        pub fn try_skip(&mut self, header: &Header, ct: &mut [u8], ad: &[u8]) -> Option<Vec<u8>> {
+            let key = (header.public_key, header.msg_num);
+            let val = self.skipped.remove_entry(&key);
+            if val.is_some() {
+                let (_, mk) = val.unwrap();
+                let header = serde_json::to_vec(header).unwrap();
+                let payload = [ad, &header].concat();
+                let pt = crypto::decrypt(&mk, ct, payload.as_slice());
+                return Some(pt);
+            }
+            None
+        }
+
+        pub fn skip(&mut self, until: u32) -> Result<(), MsgOverflowError> {
+            if until > self.n_recv + MAX_SKIP {
+                return Err(MsgOverflowError);
+            }
+
+            if self.dh_remote.is_some() {
+                while self.n_recv < until {
+                    let (ck_r, mk) = crypto::kdf_ck(&self.ck_remote);
+                    self.ck_remote = ck_r;
+                    let key = (self.dh_remote.unwrap().to_bytes(), self.n_recv);
+                    self.skipped.insert(key, mk);
+                    self.n_recv += 1
+                }
+            }
+
+            Ok(())
+        }
+
+        pub fn ratchet(&mut self, header: &Header) {
+            self.n_prev = self.n_send;
+            self.n_send = 0;
+            self.n_prev = 0;
+            self.dh_remote = Some(crypto::PublicKey::from(header.public_key));
+
+            let shared_key = self.dh_self.dh(self.dh_remote.unwrap());
+            let (rk, ck_r) = crypto::kdf_rk(&self.root_key, shared_key.as_bytes());
+            self.root_key = rk;
+            self.ck_remote = ck_r;
+
+            self.dh_self.zero(); // zero ephemeral key
+            self.dh_self = crypto::KeyPair::generate(); // update key
+
+            let shared_key = self.dh_self.dh(self.dh_remote.unwrap());
+            let (rk, ck_s) = crypto::kdf_rk(&self.root_key, shared_key.as_bytes());
+            self.root_key = rk;
+            self.ck_self = ck_s;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::state::State;
+    use super::state::{Header, Message, State};
     use crate::crypto::crypto;
+    use rand::{seq::SliceRandom, RngCore};
+    use std::collections::HashMap;
 
     #[test]
     fn test_init() {
@@ -74,5 +190,112 @@ mod tests {
         let alice = State::init_sender(sk.as_bytes(), bob_kp.public().to_bytes());
         let bob = State::init_receiver(sk.to_bytes(), bob_kp);
         assert_eq!(alice.dh_remote().unwrap(), bob.dh_self().public());
+    }
+
+    #[test]
+    fn test_header_serde() {
+        for _ in 0..(1 << 10) {
+            let h = Header {
+                public_key: rand::random::<[u8; 32]>(),
+                prev_chain_len: rand::random::<u32>(),
+                msg_num: rand::random::<u32>(),
+            };
+            let encoded = serde_json::to_vec(&h).unwrap();
+            let decoded: Option<Header> = serde_json::from_slice(&encoded).unwrap();
+            let header = decoded.unwrap();
+            assert_eq!(header.public_key, h.public_key);
+            assert_eq!(header.prev_chain_len, h.prev_chain_len);
+            assert_eq!(header.msg_num, h.msg_num);
+        }
+    }
+
+    #[test]
+    fn test_in_order() {
+        let alice_kp = crypto::KeyPair::generate();
+        let bob_kp = crypto::KeyPair::generate();
+        let sk = alice_kp.dh(bob_kp.public());
+        let mut alice = State::init_sender(sk.as_bytes(), bob_kp.public().to_bytes());
+        let mut bob = State::init_receiver(sk.to_bytes(), bob_kp);
+
+        for i in 0..(1 << 10) {
+            let size = rand::random::<usize>() % (1 << 10) + 1;
+            let mut payload = vec![0u8; size];
+            rand::thread_rng().fill_bytes(&mut payload);
+            let mut ad = vec![0u8; 32];
+            rand::thread_rng().fill_bytes(&mut ad);
+            let (h, mut ct) = alice.encrypt(&payload, ad.as_slice());
+            let decoded: Option<Header> = serde_json::from_slice(&h).unwrap();
+            let header = decoded.unwrap();
+            assert_eq!(header.msg_num, i);
+            let pt = bob.decrypt(&header, ct.as_mut_slice(), &mut ad);
+            assert_eq!(pt, payload);
+        }
+    }
+
+    #[test]
+    fn test_out_of_order() {
+        let n_msg = 1 << 10;
+        let alice_kp = crypto::KeyPair::generate();
+        let bob_kp = crypto::KeyPair::generate();
+        let sk = alice_kp.dh(bob_kp.public());
+        let mut alice = State::init_sender(sk.as_bytes(), bob_kp.public().to_bytes());
+        let mut bob = State::init_receiver(sk.to_bytes(), bob_kp);
+        let mut messages: Vec<Message> = Vec::with_capacity(n_msg);
+        let mut payloads = HashMap::<u32, Vec<u8>>::new();
+
+        for i in 0..n_msg {
+            let size = rand::random::<usize>() % (1 << 10) + 1;
+            let mut payload = vec![0u8; size];
+            rand::thread_rng().fill_bytes(&mut payload);
+            let mut ad = vec![0u8; 32];
+            rand::thread_rng().fill_bytes(&mut ad);
+            let (h, ct) = alice.encrypt(&payload, ad.as_slice());
+            messages.push(Message {
+                header: h,
+                payload: ct,
+                ad,
+            });
+            payloads.insert(i as u32, payload);
+        }
+
+        messages.shuffle(&mut rand::thread_rng());
+
+        for msg in &mut messages {
+            let decoded: Option<Header> = serde_json::from_slice(&msg.header).unwrap();
+            let header = decoded.unwrap();
+            let pt = bob.decrypt(&header, msg.payload.as_mut_slice(), msg.ad.as_slice());
+            assert_eq!(&pt, payloads.get(&header.msg_num).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_ping_pong() {
+        let alice_kp = crypto::KeyPair::generate();
+        let bob_kp = crypto::KeyPair::generate();
+        let sk = alice_kp.dh(bob_kp.public());
+        let mut alice = State::init_sender(sk.as_bytes(), bob_kp.public().to_bytes());
+        let mut bob = State::init_receiver(sk.to_bytes(), bob_kp);
+
+        for _ in 0..(1 << 10) {
+            let size = rand::random::<usize>() % (1 << 10) + 1;
+            let mut payload = vec![0u8; size];
+            rand::thread_rng().fill_bytes(&mut payload);
+            let mut ad = vec![0u8; 32];
+            rand::thread_rng().fill_bytes(&mut ad);
+            let (h, mut ct) = alice.encrypt(&payload, ad.as_slice());
+            let decoded: Option<Header> = serde_json::from_slice(&h).unwrap();
+            let header = decoded.unwrap();
+            let pt = bob.decrypt(&header, ct.as_mut_slice(), &mut ad);
+            assert_eq!(pt, payload);
+
+            let size = rand::random::<usize>() % (1 << 10) + 1;
+            let mut payload = vec![0u8; size];
+            rand::thread_rng().fill_bytes(&mut payload);
+            let (h, mut ct) = bob.encrypt(&payload, ad.as_slice());
+            let decoded: Option<Header> = serde_json::from_slice(&h).unwrap();
+            let header = decoded.unwrap();
+            let pt = alice.decrypt(&header, ct.as_mut_slice(), &mut ad);
+            assert_eq!(pt, payload);
+        }
     }
 }
