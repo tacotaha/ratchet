@@ -4,47 +4,54 @@ pub mod crypto {
     use hmac::{Hmac, Mac};
     use rand::rngs::OsRng;
     use sha2::Sha512;
-    use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+    pub use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
     const BLOCK_SIZE: usize = 32;
     type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
     type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
     pub struct KeyPair {
-        private: EphemeralSecret,
+        private: StaticSecret,
         public: PublicKey,
     }
 
     impl KeyPair {
         pub fn generate() -> Self {
-            let sk = EphemeralSecret::new(OsRng);
+            let sk = StaticSecret::new(OsRng);
             Self {
                 public: PublicKey::from(&sk),
                 private: sk,
             }
         }
+
+        #[inline]
         pub fn public(&self) -> PublicKey {
             self.public
         }
-        pub fn dh(self, pk: PublicKey) -> SharedSecret {
+
+        #[inline]
+        pub fn dh(&self, pk: PublicKey) -> SharedSecret {
             self.private.diffie_hellman(&pk)
         }
     }
 
-    pub fn kdf_rk(rk: &mut [u8; 32], dh_out: &mut [u8; 32]) -> [u8; 64] {
+    pub fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
         let mut okm = [0u8; 64];
-        let hk = Hkdf::<Sha512>::new(Some(&rk[..]), dh_out);
+        let hk = Hkdf::<Sha512>::new(Some(rk), dh_out);
         hk.expand(b"ratchet-hkdf-sha512", &mut okm).unwrap();
-        okm
+        let (root_key, chain_key) = okm.split_at(32);
+        (root_key.try_into().unwrap(), chain_key.try_into().unwrap())
     }
 
-    pub fn kdf_ck(ck: &mut [u8; 32]) -> [u8; 64] {
+    pub fn kdf_ck(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
         let mut mac = Hmac::<Sha512>::new_from_slice(ck).unwrap();
         mac.update(b"ratchet-hmac-sha512");
-        mac.finalize().into_bytes().try_into().unwrap()
+        let res = mac.finalize().into_bytes();
+        let (chain_key, msg_key) = res.split_at(32);
+        (chain_key.try_into().unwrap(), msg_key.try_into().unwrap())
     }
 
-    pub fn kdf_aes(mk: &mut [u8]) -> ([u8; 32], [u8; 32], [u8; 16]) {
+    pub fn kdf_aes(mk: &[u8]) -> ([u8; 32], [u8; 32], [u8; 16]) {
         let salt = [0u8; 64];
         let mut okm = [0u8; 80];
         let hk = Hkdf::<Sha512>::new(Some(&salt), mk);
@@ -58,33 +65,27 @@ pub mod crypto {
         )
     }
 
-    pub fn encrypt(mk: &mut [u8], pt: &mut [u8], data: &mut [u8]) -> Vec<u8> {
+    pub fn encrypt(mk: &[u8], pt: &[u8], data: &[u8]) -> Vec<u8> {
         let (enc_key, auth_key, iv) = kdf_aes(mk);
-
         let pt_len = pt.len();
         let mut buf = vec![0u8; pt_len + (BLOCK_SIZE - pt_len % BLOCK_SIZE)];
         buf[..pt_len].copy_from_slice(&pt);
-
         let ct = Aes256CbcEnc::new(&enc_key.into(), &iv.into())
             .encrypt_padded_mut::<Pkcs7>(&mut buf, pt_len)
             .unwrap();
-
         let mut mac = Hmac::<Sha512>::new_from_slice(&auth_key).unwrap();
         mac.update(data);
         let auth_tag: [u8; 64] = mac.finalize().into_bytes().try_into().unwrap();
-
         [ct, &auth_tag].concat()
     }
 
-    pub fn decrypt(mk: &mut [u8], ct: &mut [u8], data: &mut [u8]) -> Vec<u8> {
+    pub fn decrypt(mk: &[u8], ct: &mut [u8], data: &[u8]) -> Vec<u8> {
         let payload_len = ct.len() - 64;
         let (payload, auth_tag) = ct.split_at_mut(payload_len);
         let (enc_key, auth_key, iv) = kdf_aes(mk);
-
         let mut mac = Hmac::<Sha512>::new_from_slice(&auth_key).unwrap();
         mac.update(data);
         mac.verify_slice(auth_tag).unwrap();
-
         let pt = Aes256CbcDec::new(&enc_key.into(), &iv.into())
             .decrypt_padded_mut::<Pkcs7>(payload)
             .unwrap();
